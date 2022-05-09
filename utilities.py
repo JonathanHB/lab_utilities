@@ -3,30 +3,28 @@ import mdtraj as md
 from enspara.geometry.pockets import xyz_to_mdtraj
 import enspara.geometry.libdist
 
+import time
+
 def get_nearby_residues(holo_xtal, apo_xtal, ligand_resn, dist_cutoff, computeshared = False):
 
     #handle bricks
     if ligand_resn == "None":
         print("no valid ligands found")
-        return [] #prot_info, np.array([], int), np.array([], int), np.array([], int), np.array([], int), np.zeros(apo_xtal.top.n_residues, int)]
+        return []
 
     #handle everything else
     if type(ligand_resn) == str: #select single ligands
         ligand_select_str = f"resname '{ligand_resn}'"
+
     elif len(ligand_resn)>1:     #select multiple ligands
         #assemble query for all ligands listed
-        #ligand_select_str = f"resname '{ligand_resn[0]}'"
         molecule_queries = []
         for lname in ligand_resn:
             molecule_queries.append(f"resname '{lname}'")
-            #ligand_select_str += f" or resname '{lname}'"
         ligand_select_str = " or ".join(molecule_queries)
+
     else:                        #use hardcoded query
         ligand_select_str = ligand_resn[0]
-
-    #if len(molecule_queries) == 0:
-    #    print("no valid ligands found")
-    #    return False
 
     #get indices of ligand and protein atoms
     ligand_ai = holo_xtal.top.select(f"({ligand_select_str}) and not element H")
@@ -60,12 +58,14 @@ def get_nearby_residues(holo_xtal, apo_xtal, ligand_resn, dist_cutoff, computesh
             print(f'error: atom {i} is in neither sidechain nor backbone')
             break
 
+    #remove redundant entries
     sele = np.unique(sele)
 
+    #get apo and holo atom indices for ligand-lining residue segments
     prot_iis_holo = np.concatenate([holo_xtal.top.select(f"{sel} and not element H") for sel in sele]).ravel()
     prot_iis_apo = np.concatenate([apo_xtal.top.select(f"{sel} and not element H") for sel in sele]).ravel()
 
-    #compute atom indices of residues present in both apo and holo structures; usually for RMSD calculations
+    #compute atom indices of ligand-lining residue segments present in both apo and holo structures; usually for RMSD calculations
     if computeshared:
         #note that this code does not introduce any duplicate indices and hence no application of np.unique is needed
         prot_iis_holo_shared = []
@@ -92,46 +92,46 @@ def cryptic_pocket_vol(xtal, pv_pdb, pocket_ai, savepock=False, savename = "", o
 
     if savepock:
         #coordinates of the ligsite pocket elements owned by atoms of ligand-coordinating residue segments
-        pocket_ele = [] # for qc
+        #used for qc and figures
+        pocket_ele = []
 
-    protein_iis = xtal.top.select("protein and not element H") #protein atom indices
+    #all protein atom indices
+    #note that no speedup could be obtained here by the use of list comprehension instead of mdtraj
+    protein_iis = xtal.top.select("protein and not element H")
+
 
     #the number of pocket elements which are nearer to each ligand-lining atom than to any other atom
     # = the number of pocket elements owned by that atom
+    #this may be done with a dictionary instead, which is more intuitive and eliminates the np.where() statement below, but there appears to be no speed advantage to this
     num_owned_pock_ele = np.zeros(len(pocket_ai))
 
-    for pocket_coord in pv_pdb.xyz[0]: #loop over pocket coordinates
 
-        #calculate the distance to all crystal structure atoms and sort to find the closest atoms
-        dists = enspara.geometry.libdist.euclidean(xtal.xyz[0], pocket_coord)
-        atom_distance_iis = np.argsort(dists)
+    #loop over pocket coordinates to assign each one to a protein atom
+    for pocket_coord in pv_pdb.xyz[0]:
 
-        #go down the list of nearest atoms to find the nearest protein atom to the pocket
-        for i in atom_distance_iis:
-            if i in protein_iis:
-                if i in pocket_ai:
+        #calculate the distance from the current pocket element to all
+        #protein atoms and sort to find the closest protein atom
+        ##dists = enspara.geometry.libdist.euclidean(xtal.xyz[0][protein_iis], pocket_coord)
+        ##atom_distance_iis = np.argsort(dists)
 
-                    #Keep track of which atom in the cryptic pocket lining owns how many pocket elements
-                    #and the coordinates of the pocket elements filling the cryptic pocket.
+        #assign the grid point to the nearest protein atom
+        ##i = protein_iis[atom_distance_iis[0]]
+        i = protein_iis[np.argsort(enspara.geometry.libdist.euclidean(xtal.xyz[0][protein_iis], pocket_coord))[0]]
 
-                    #get the index of the protein atom in the list of ligand-coordinating residue atoms
-                    #and add 1 to the number of pocket atoms that it owns
-                    num_owned_pock_ele[np.where(pocket_ai==i)[0][0]] += 1
+        if i in pocket_ai:
+            #Keep track of which atom in the cryptic pocket lining owns how many pocket elements
+            #and the coordinates of the pocket elements filling the cryptic pocket.
 
-                    if savepock:
-                        pocket_ele.append(pocket_coord) #for qc
+            #get the index of the protein atom in the list of ligand-coordinating residue atoms
+            #and add 1 to the number of pocket atoms that it owns
+            num_owned_pock_ele[np.where(pocket_ai==i)[0][0]] += 1
 
-                    break #don't assign the pocket coordinate to multiple owners
-
-                else:
-                    #a protein atom outside of the pocket lining owns this pocket element
-                    break
-            else:
-                #do not assign pocket volume to hydrogens, ligand atoms, or other non-protein atoms such as structural ions
-                continue
+            if savepock:
+                pocket_ele.append(pocket_coord)
 
     if savepock:
         #save a pdb of holo pocket elements owned by ligand coordinating residues for QC
+
         pocket_pdb = xyz_to_mdtraj(np.array(pocket_ele))
         pocket_pdb.save(f"{output_dir}/qc-output/{savename}-lig-coord-resi-adjacent-ligsite-pockets.pdb")
 
@@ -141,20 +141,22 @@ def cryptic_pocket_vol(xtal, pv_pdb, pocket_ai, savepock=False, savename = "", o
 #get the paths to the cluster centers and pockets for a given FAST gen
 #[zip, number of centers]
 
-def paths_zipped(gen, n_gens, apo_id, fast_path, ctr="*"):
+def paths_zipped(gen, n_gens, apo_id, fast_path):
 
     if gen != n_gens-1:
-        path_strings = [f"{fast_path}/FASTPockets-{apo_id}/msm/old/centers_masses{gen}/state{ctr}-00.pdb",
-                        f"{fast_path}/FASTPockets-{apo_id}/msm/old/pocket_analysis{gen}/state{ctr}/state{ctr}_pockets.pdb"]
+        path_strings = [f"{fast_path}/FASTPockets-{apo_id}/msm/old/centers_masses{gen}/state*-00.pdb",
+                        f"{fast_path}/FASTPockets-{apo_id}/msm/old/pocket_analysis{gen}/state*/state*_pockets.pdb"]
     else:
-        path_strings = [f"{fast_path}/FASTPockets-{apo_id}/msm/centers_masses/state{ctr}-00.pdb",
-                        f"{fast_path}/FASTPockets-{apo_id}/msm/pocket_analysis/state{ctr}/state{ctr}_pockets.pdb"]
+        path_strings = [f"{fast_path}/FASTPockets-{apo_id}/msm/centers_masses/state*-00.pdb",
+                        f"{fast_path}/FASTPockets-{apo_id}/msm/pocket_analysis/state*/state*_pockets.pdb"]
 
     ctrs_fns = glob.glob(path_strings[0])
 
     return [zip(np.sort(ctrs_fns), np.sort(glob.glob(path_strings[1]))), len(ctrs_fns)]
 
 #-------------------------------------------------------------------------------
+#get the paths to the cluster centers and pockets for a given center in a given FAST gen
+#[path to cluster center structure, path to cluster center pockets]
 
 def fast_paths(fast_path, apo_id, gen, n_gens, ctr):
 
@@ -172,7 +174,7 @@ def fast_paths(fast_path, apo_id, gen, n_gens, ctr):
 #-------------------------------------------------------------------------------
 
 #calculate the cryptic pocket volumes, RMSDs, and SASAs for all cluster centers in the given gen
-def vols_by_gen(gen, n_gens, apo_id, prot_masses_pocket_ai, fast_path): #, holo_pocket_coord):
+def vols_by_gen(gen, n_gens, apo_id, prot_masses_pocket_ai, fast_path):
 
     #get zipped filepaths to cluster centers and pockets and the number of cluster centers
     #[zip, number of centers]
@@ -180,7 +182,6 @@ def vols_by_gen(gen, n_gens, apo_id, prot_masses_pocket_ai, fast_path): #, holo_
 
     #store calculated properties
     pvols = []
-    #rmsds = []
 
     count = 0 #for print output
 
@@ -189,14 +190,13 @@ def vols_by_gen(gen, n_gens, apo_id, prot_masses_pocket_ai, fast_path): #, holo_
 
         ctr = md.load(ctr_fn)
 
-        #rmsds.append(calc_rmsd(ctr, holo_pocket_coord, prot_masses_pocket_res_iis)[0])
-
         #load pockets if applicable and calculate volume owned by them
         try:
             pocket = md.load(pocket_fn)
             pvols.append(cryptic_pocket_vol(ctr, pocket, prot_masses_pocket_res_iis))
-        except: #some structures have zero pocket volume, whereupon ligsite crashes
-            #and no pocket file is generated, causing md.load to crash
+        #some structures have zero pocket volume, whereupon ligsite crashes
+        #and no pocket file is generated, causing md.load to crash
+        except:
             print("pocket skipped") #or an error occured in cryptic_pocket_vol
             pvols.append(0)
             continue
@@ -206,4 +206,4 @@ def vols_by_gen(gen, n_gens, apo_id, prot_masses_pocket_ai, fast_path): #, holo_
         if count % 50 == 0:
             print(count / filepaths_zipped[1])
 
-    return pvols #[pvols, rmsds]
+    return pvols
